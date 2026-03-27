@@ -5,14 +5,17 @@ $ErrorActionPreference = 'Stop'
 param(
     [switch]$Resume,
 
-    # Default is True; you can pass -MicrosoftUpdate:$false for OS-only
-    [bool]$MicrosoftUpdate = $true,
+    # Allow: -MicrosoftUpdate (true), -MicrosoftUpdate:$false, or omit entirely (defaults to true)
+    [Nullable[bool]]$MicrosoftUpdate = $null,
 
     [ValidateRange(1, 50)]
     [int]$MaxRuns = 12
 )
 
 try {
+    # Default behaviour if not specified
+    if ($null -eq $MicrosoftUpdate) { $MicrosoftUpdate = $true }
+
     # Quiet / setup-friendly defaults
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
