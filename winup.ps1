@@ -5,17 +5,17 @@ $ErrorActionPreference = 'Stop'
 param(
     [switch]$Resume,
 
-    # Allow: -MicrosoftUpdate (true), -MicrosoftUpdate:$false, or omit entirely (defaults to true)
-    [Nullable[bool]]$MicrosoftUpdate = $null,
+    # defaulted after param() using PSBoundParameters
+    [bool]$MicrosoftUpdate,
 
     [ValidateRange(1, 50)]
     [int]$MaxRuns = 12
 )
 
-try {
-    # Default behaviour if not specified
-    if ($null -eq $MicrosoftUpdate) { $MicrosoftUpdate = $true }
+# Defaults that avoid param() edge cases in OOBE
+if (-not $PSBoundParameters.ContainsKey('MicrosoftUpdate')) { $MicrosoftUpdate = $true }
 
+try {
     # Quiet / setup-friendly defaults
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -34,8 +34,7 @@ try {
     function Write-Log {
         param([string]$Message)
         $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        $line = "$ts  $Message"
-        Add-Content -LiteralPath $LogPath -Value $line -ErrorAction SilentlyContinue
+        Add-Content -LiteralPath $LogPath -Value "$ts  $Message" -ErrorAction SilentlyContinue
         Write-Output $Message
     }
 
@@ -51,7 +50,6 @@ try {
         ($state | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $StatePath -Force
     }
 
-    # Bootstrap: NuGet + PSGallery trust + PowerShellGet best effort
     function Ensure-NuGetAndGalleryTrust {
         if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
             Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
@@ -71,9 +69,6 @@ try {
         }
     }
 
-    # Source URL handling:
-    # - first run reads env var (set by W.BAT) and persists to source.txt
-    # - resume runs read source.txt (env var won't exist after reboot)
     function Get-SourceUrl {
         if (Test-Path -LiteralPath $SourcePath) {
             $u = (Get-Content -LiteralPath $SourcePath -Raw -ErrorAction SilentlyContinue).Trim()
@@ -89,7 +84,6 @@ try {
         return $u
     }
 
-    # Resume mechanism: Scheduled Task at startup that re-downloads and re-runs script
     function Ensure-ResumeScheduledTask {
         Import-Module ScheduledTasks -ErrorAction SilentlyContinue | Out-Null
 
@@ -97,16 +91,20 @@ try {
         if ($existing) { return }
 
         $null = Get-SourceUrl
+
         Write-Log "Creating Scheduled Task: $TaskName"
+
+        $muLiteral = if ($MicrosoftUpdate) { '$true' } else { '$false' }
 
         $cmd = @"
 Start-Sleep -Seconds 30
 `$u = (Get-Content -Raw '$SourcePath').Trim()
-if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
+if (-not [string]::IsNullOrWhiteSpace(`$u)) {
+  iex (irm `$u) -Resume -MicrosoftUpdate:$muLiteral -MaxRuns $MaxRuns
+}
 "@
 
-        $bytes   = [Text.Encoding]::Unicode.GetBytes($cmd)
-        $encoded = [Convert]::ToBase64String($bytes)
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
 
         $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
         $trigger = New-ScheduledTaskTrigger -AtStartup
@@ -131,7 +129,6 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
         }
     }
 
-    # PSWindowsUpdate setup
     function Ensure-PSWindowsUpdate {
         if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate -ErrorAction SilentlyContinue)) {
             Write-Log "Installing PSWindowsUpdate module..."
@@ -171,7 +168,7 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
     }
 
     # Main
-    Write-Log "Starting Windows Update runner. Resume = $Resume; MicrosoftUpdate = $MicrosoftUpdate"
+    Write-Log "Starting Windows Update runner. Resume=$Resume; MicrosoftUpdate=$MicrosoftUpdate; MaxRuns=$MaxRuns"
 
     Ensure-NuGetAndGalleryTrust
     $null = Get-SourceUrl
@@ -182,7 +179,7 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
     $state.RunCount = [int]$state.RunCount + 1
     Save-State $state
 
-    Write-Log "RunCount = $($state.RunCount) (MaxRuns = $MaxRuns)"
+    Write-Log "RunCount=$($state.RunCount) (MaxRuns=$MaxRuns)"
 
     if ($state.RunCount -gt $MaxRuns) {
         Write-Log "MaxRuns exceeded. Cleaning up scheduled task to prevent looping."
@@ -207,10 +204,10 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
 }
 catch {
     try {
-        $root = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
-        New-Item -Path $root -ItemType Directory -Force | Out-Null
-        $log = Join-Path $root 'update.log'
-        Add-Content -LiteralPath $log -Value ("{0}  ERROR  {1}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) -ErrorAction SilentlyContinue
+        New-Item -Path (Join-Path $env:ProgramData 'WBU-WindowsUpdate') -ItemType Directory -Force | Out-Null
+        Add-Content -LiteralPath (Join-Path $env:ProgramData 'WBU-WindowsUpdate\update.log') `
+            -Value ("{0}  ERROR  {1}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) `
+            -ErrorAction SilentlyContinue
     } catch { }
 
     Write-Error $_
