@@ -5,17 +5,17 @@ $ErrorActionPreference = 'Stop'
 param(
     [switch]$Resume,
 
-    # defaulted after param() using PSBoundParameters
-    [bool]$MicrosoftUpdate,
+    # If specified, only Windows updates are installed (no Microsoft Update catalogue such as Office)
+    [switch]$OSOnly,
 
     [ValidateRange(1, 50)]
     [int]$MaxRuns = 12
 )
 
-# Defaults that avoid param() edge cases in OOBE
-if (-not $PSBoundParameters.ContainsKey('MicrosoftUpdate')) { $MicrosoftUpdate = $true }
-
 try {
+    # Determine whether to use Microsoft Update
+    $UseMicrosoftUpdate = -not $OSOnly
+
     # Quiet / setup-friendly defaults
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -91,16 +91,16 @@ try {
         if ($existing) { return }
 
         $null = Get-SourceUrl
-
         Write-Log "Creating Scheduled Task: $TaskName"
 
-        $muLiteral = if ($MicrosoftUpdate) { '$true' } else { '$false' }
+        # Build the exact resume invocation
+        $osOnlyArg = if ($OSOnly) { ' -OSOnly' } else { '' }
 
         $cmd = @"
 Start-Sleep -Seconds 30
 `$u = (Get-Content -Raw '$SourcePath').Trim()
 if (-not [string]::IsNullOrWhiteSpace(`$u)) {
-  iex (irm `$u) -Resume -MicrosoftUpdate:$muLiteral -MaxRuns $MaxRuns
+  iex (irm `$u) -Resume -MaxRuns $MaxRuns$osOnlyArg
 }
 "@
 
@@ -137,7 +137,7 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) {
 
         Import-Module PSWindowsUpdate -Force -ErrorAction Stop | Out-Null
 
-        if ($MicrosoftUpdate) {
+        if ($UseMicrosoftUpdate) {
             try { Add-WUServiceManager -MicrosoftUpdate -ErrorAction SilentlyContinue | Out-Null } catch { }
         }
     }
@@ -147,7 +147,7 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) {
             IgnoreUserInput = $true
             ErrorAction     = 'SilentlyContinue'
         }
-        if ($MicrosoftUpdate) { $params['MicrosoftUpdate'] = $true }
+        if ($UseMicrosoftUpdate) { $params['MicrosoftUpdate'] = $true }
 
         $updates = Get-WindowsUpdate @params
         if ($updates) { return $updates.Count }
@@ -162,13 +162,13 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) {
             Confirm         = $false
             ErrorAction     = 'Stop'
         }
-        if ($MicrosoftUpdate) { $params['MicrosoftUpdate'] = $true }
+        if ($UseMicrosoftUpdate) { $params['MicrosoftUpdate'] = $true }
 
         Install-WindowsUpdate @params | Out-Null
     }
 
     # Main
-    Write-Log "Starting Windows Update runner. Resume=$Resume; MicrosoftUpdate=$MicrosoftUpdate; MaxRuns=$MaxRuns"
+    Write-Log "Starting Windows Update runner. Resume=$Resume; OSOnly=$OSOnly; MaxRuns=$MaxRuns"
 
     Ensure-NuGetAndGalleryTrust
     $null = Get-SourceUrl
