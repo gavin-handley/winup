@@ -15,17 +15,18 @@ try {
     # ------------------------------------------------------------
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
     $ProgressPreference = 'SilentlyContinue'
 
     # ------------------------------------------------------------
-    # Paths / state / logging / cached local runner
+    # Paths / state / logging / persisted source URL
     # ------------------------------------------------------------
-    $Root        = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
-    $StatePath   = Join-Path $Root 'state.json'
-    $LogPath     = Join-Path $Root 'update.log'
-    $LocalScript = Join-Path $Root 'Run-WindowsUpdate.ps1'
-    $TaskName    = 'WBU-WindowsUpdate-Resume'
+    $Root       = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
+    $StatePath  = Join-Path $Root 'state.json'
+    $LogPath    = Join-Path $Root 'update.log'
+    $SourcePath = Join-Path $Root 'source.txt'
+    $TaskName   = 'WBU-WindowsUpdate-Resume'
 
     New-Item -Path $Root -ItemType Directory -Force | Out-Null
 
@@ -72,24 +73,30 @@ try {
     }
 
     # ------------------------------------------------------------
-    # Cache this running script locally (no URL required)
+    # Source URL handling:
+    # - first run reads env var (set by W.BAT) and persists to source.txt
+    # - resume runs read source.txt (env var won't exist after reboot)
     # ------------------------------------------------------------
-    function Ensure-LocalScriptCache {
-        if (Test-Path -LiteralPath $LocalScript) { return }
-
-        # When invoked via iex(irm ...), Definition contains the whole script text.
-        $scriptText = $MyInvocation.MyCommand.Definition
-
-        if ([string]::IsNullOrWhiteSpace($scriptText) -or $scriptText.Length -lt 200) {
-            throw "Unable to cache script locally. Script text was unexpectedly empty/short."
+    function Get-SourceUrl {
+        # 1) Prefer persisted file
+        if (Test-Path -LiteralPath $SourcePath) {
+            $u = (Get-Content -LiteralPath $SourcePath -Raw -ErrorAction SilentlyContinue).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($u)) { return $u }
         }
 
-        Set-Content -LiteralPath $LocalScript -Value $scriptText -Encoding UTF8 -Force
-        Write-Log "Cached local script: $LocalScript"
+        # 2) Fall back to environment variable
+        $u = ($env:WBU_WU_SOURCE_URL | ForEach-Object { $_.Trim() })
+        if ([string]::IsNullOrWhiteSpace($u)) {
+            throw "Missing WBU_WU_SOURCE_URL. Your USB W.BAT must set WBU_WU_SOURCE_URL before launching the script."
+        }
+
+        # Persist for post-reboot runs
+        Set-Content -LiteralPath $SourcePath -Value $u -Encoding UTF8 -Force
+        return $u
     }
 
     # ------------------------------------------------------------
-    # Resume mechanism: startup scheduled task that runs the cached local script
+    # Resume mechanism: Scheduled Task at startup that re-downloads and re-runs script
     # ------------------------------------------------------------
     function Ensure-ResumeScheduledTask {
         Import-Module ScheduledTasks -ErrorAction SilentlyContinue | Out-Null
@@ -97,17 +104,25 @@ try {
         $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($existing) { return }
 
-        Ensure-LocalScriptCache
+        $null = Get-SourceUrl
 
         Write-Log "Creating Scheduled Task: $TaskName"
 
-        $args = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScript`" -Resume" +
-                ($(if ($MicrosoftUpdate) { " -MicrosoftUpdate" } else { "" })) +
-                " -MaxRuns $MaxRuns"
+        # Read URL from source.txt at runtime, then download and resume
+        $cmd = @"
+Start-Sleep -Seconds 30
+`$u = (Get-Content -Raw '$SourcePath').Trim()
+if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
+"@
 
-        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args
-        $trigger   = New-ScheduledTaskTrigger -AtStartup
-        $settings  = New-ScheduledTaskSettingsSet `
+        # Use -EncodedCommand to avoid cmd quoting issues
+        $bytes = [Text.Encoding]::Unicode.GetBytes($cmd)
+        $encoded = [Convert]::ToBase64String($bytes)
+
+        $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+
+        $settings = New-ScheduledTaskSettingsSet `
             -StartWhenAvailable `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
@@ -174,7 +189,10 @@ try {
     Write-Log "Starting Windows Update runner. Resume = $Resume"
 
     Ensure-NuGetAndGalleryTrust
-    Ensure-LocalScriptCache
+
+    # Persist the source URL for after reboot runs
+    $null = Get-SourceUrl
+
     Ensure-ResumeScheduledTask
     Ensure-PSWindowsUpdate
 
@@ -202,16 +220,15 @@ try {
     Write-Log "Found $pending update(s). Installing with AutoReboot..."
     Install-UpdatesOnce
 
-    # If a reboot happens, this process ends; the scheduled task resumes at next startup.
-    Write-Log "Install pass complete. If reboot required, resume will occur automatically."
+    Write-Log "Install pass complete. If reboot is required, resume will occur automatically."
     exit 0
 }
 catch {
     try {
-        $Root = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
-        New-Item -Path $Root -ItemType Directory -Force | Out-Null
-        $LogPath = Join-Path $Root 'update.log'
-        Add-Content -LiteralPath $LogPath -Value ("{0}  ERROR  {1}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) -ErrorAction SilentlyContinue
+        $root = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
+        New-Item -Path $root -ItemType Directory -Force | Out-Null
+        $log = Join-Path $root 'update.log'
+        Add-Content -LiteralPath $log -Value ("{0}  ERROR  {1}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) -ErrorAction SilentlyContinue
     } catch { }
 
     Write-Error $_
