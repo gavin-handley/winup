@@ -3,13 +3,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 param(
-    # Internal flag used when the scheduled task re-invokes the script
     [switch]$Resume,
-
-    # Optional: install Microsoft Update (Office/other MS products) as well as Windows updates
     [switch]$MicrosoftUpdate = $true,
-
-    # Safety valve to avoid endless loops if an update continually fails
     [ValidateRange(1, 50)]
     [int]$MaxRuns = 12
 )
@@ -18,19 +13,19 @@ try {
     # ------------------------------------------------------------
     # Quiet / setup-friendly defaults
     # ------------------------------------------------------------
-    $env:MG_SHOW_WELCOME_MESSAGE = 'false' # harmless here, keeps console quieter in mixed environments
+    $env:MG_SHOW_WELCOME_MESSAGE = 'false'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
     $ProgressPreference = 'SilentlyContinue'
 
     # ------------------------------------------------------------
-    # Paths / state / logging
+    # Paths / state / logging / cached local runner
     # ------------------------------------------------------------
-    $Root      = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
-    $StatePath = Join-Path $Root 'state.json'
-    $LogPath   = Join-Path $Root 'update.log'
-    $TaskName  = 'WBU-WindowsUpdate-Resume'
+    $Root        = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
+    $StatePath   = Join-Path $Root 'state.json'
+    $LogPath     = Join-Path $Root 'update.log'
+    $LocalScript = Join-Path $Root 'Run-WindowsUpdate.ps1'
+    $TaskName    = 'WBU-WindowsUpdate-Resume'
 
     New-Item -Path $Root -ItemType Directory -Force | Out-Null
 
@@ -72,50 +67,47 @@ try {
             Import-Module PowerShellGet -Force -ErrorAction Stop | Out-Null
         }
         catch {
-            # If PowerShellGet can't be updated (common in early setup), fall back to in-box
             Import-Module PowerShellGet -ErrorAction SilentlyContinue | Out-Null
         }
     }
 
     # ------------------------------------------------------------
-    # Resume mechanism: startup scheduled task that re-downloads and runs this script
-    # URL is supplied via env var from your USB .bat (not hardcoded here)
+    # Cache this running script locally (no URL required)
     # ------------------------------------------------------------
-    function Get-SourceUrl {
-        # The .bat sets this before calling iex(irm ...)
-        $url = $env:WBU_WU_SOURCE_URL
+    function Ensure-LocalScriptCache {
+        if (Test-Path -LiteralPath $LocalScript) { return }
 
-        if ([string]::IsNullOrWhiteSpace($url)) {
-            throw "Missing environment variable WBU_WU_SOURCE_URL. Your USB .bat must set it to your bit.ly URL before launching the script."
+        # When invoked via iex(irm ...), Definition contains the whole script text.
+        $scriptText = $MyInvocation.MyCommand.Definition
+
+        if ([string]::IsNullOrWhiteSpace($scriptText) -or $scriptText.Length -lt 200) {
+            throw "Unable to cache script locally. Script text was unexpectedly empty/short."
         }
 
-        return $url
+        Set-Content -LiteralPath $LocalScript -Value $scriptText -Encoding UTF8 -Force
+        Write-Log "Cached local script: $LocalScript"
     }
 
+    # ------------------------------------------------------------
+    # Resume mechanism: startup scheduled task that runs the cached local script
+    # ------------------------------------------------------------
     function Ensure-ResumeScheduledTask {
         Import-Module ScheduledTasks -ErrorAction SilentlyContinue | Out-Null
 
         $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($existing) { return }
 
-        $url = Get-SourceUrl
+        Ensure-LocalScriptCache
 
         Write-Log "Creating Scheduled Task: $TaskName"
 
-        # Startup action:
-        # - Wait briefly for networking/services
-        # - Set env var for this process
-        # - Download and invoke the script again with -Resume
-        $cmd = @"
-Start-Sleep -Seconds 30;
-`$env:WBU_WU_SOURCE_URL = '$url';
-iex (irm `$env:WBU_WU_SOURCE_URL) -Resume
-"@
+        $args = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScript`" -Resume" +
+                ($(if ($MicrosoftUpdate) { " -MicrosoftUpdate" } else { "" })) +
+                " -MaxRuns $MaxRuns"
 
-        $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -Command $([Management.Automation.Language.CodeGeneration]::QuoteArgument($cmd))"
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-
-        $settings = New-ScheduledTaskSettingsSet `
+        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args
+        $trigger   = New-ScheduledTaskTrigger -AtStartup
+        $settings  = New-ScheduledTaskSettingsSet `
             -StartWhenAvailable `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
@@ -147,7 +139,6 @@ iex (irm `$env:WBU_WU_SOURCE_URL) -Resume
         Import-Module PSWindowsUpdate -Force -ErrorAction Stop | Out-Null
 
         if ($MicrosoftUpdate) {
-            # Best effort: enable Microsoft Update catalogue (Office/other MS products)
             try { Add-WUServiceManager -MicrosoftUpdate -ErrorAction SilentlyContinue | Out-Null } catch { }
         }
     }
@@ -164,5 +155,65 @@ iex (irm `$env:WBU_WU_SOURCE_URL) -Resume
         return 0
     }
 
-    function Install-Updates {
+    function Install-UpdatesOnce {
         $params = @{
+            AcceptAll       = $true
+            AutoReboot      = $true
+            IgnoreUserInput = $true
+            Confirm         = $false
+            ErrorAction     = 'Stop'
+        }
+        if ($MicrosoftUpdate) { $params['MicrosoftUpdate'] = $true }
+
+        Install-WindowsUpdate @params | Out-Null
+    }
+
+    # ------------------------------------------------------------
+    # Main
+    # ------------------------------------------------------------
+    Write-Log "Starting Windows Update runner. Resume = $Resume"
+
+    Ensure-NuGetAndGalleryTrust
+    Ensure-LocalScriptCache
+    Ensure-ResumeScheduledTask
+    Ensure-PSWindowsUpdate
+
+    $state = Load-State
+    $state.RunCount = [int]$state.RunCount + 1
+    Save-State $state
+
+    Write-Log "RunCount = $($state.RunCount) (MaxRuns = $MaxRuns)"
+
+    if ($state.RunCount -gt $MaxRuns) {
+        Write-Log "MaxRuns exceeded. Cleaning up scheduled task to prevent looping."
+        Remove-ResumeScheduledTask
+        throw "Stopped after $MaxRuns runs. Check Windows Update for stuck/failed updates."
+    }
+
+    $pending = Get-PendingUpdatesCount
+    if ($pending -le 0) {
+        Write-Log "No updates found. Cleaning up scheduled task and state."
+        Remove-ResumeScheduledTask
+        Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
+        Write-Log "Completed."
+        exit 0
+    }
+
+    Write-Log "Found $pending update(s). Installing with AutoReboot..."
+    Install-UpdatesOnce
+
+    # If a reboot happens, this process ends; the scheduled task resumes at next startup.
+    Write-Log "Install pass complete. If reboot required, resume will occur automatically."
+    exit 0
+}
+catch {
+    try {
+        $Root = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
+        New-Item -Path $Root -ItemType Directory -Force | Out-Null
+        $LogPath = Join-Path $Root 'update.log'
+        Add-Content -LiteralPath $LogPath -Value ("{0}  ERROR  {1}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) -ErrorAction SilentlyContinue
+    } catch { }
+
+    Write-Error $_
+    exit 1
+}
