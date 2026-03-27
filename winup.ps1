@@ -4,24 +4,22 @@ $ErrorActionPreference = 'Stop'
 
 param(
     [switch]$Resume,
-    [switch]$MicrosoftUpdate = $true,
+
+    # Default is True; you can pass -MicrosoftUpdate:$false for OS-only
+    [bool]$MicrosoftUpdate = $true,
+
     [ValidateRange(1, 50)]
     [int]$MaxRuns = 12
 )
 
 try {
-    # ------------------------------------------------------------
     # Quiet / setup-friendly defaults
-    # ------------------------------------------------------------
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
     $ProgressPreference = 'SilentlyContinue'
 
-    # ------------------------------------------------------------
     # Paths / state / logging / persisted source URL
-    # ------------------------------------------------------------
     $Root       = Join-Path $env:ProgramData 'WBU-WindowsUpdate'
     $StatePath  = Join-Path $Root 'state.json'
     $LogPath    = Join-Path $Root 'update.log'
@@ -50,9 +48,7 @@ try {
         ($state | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $StatePath -Force
     }
 
-    # ------------------------------------------------------------
     # Bootstrap: NuGet + PSGallery trust + PowerShellGet best effort
-    # ------------------------------------------------------------
     function Ensure-NuGetAndGalleryTrust {
         if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
             Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
@@ -72,32 +68,25 @@ try {
         }
     }
 
-    # ------------------------------------------------------------
     # Source URL handling:
     # - first run reads env var (set by W.BAT) and persists to source.txt
     # - resume runs read source.txt (env var won't exist after reboot)
-    # ------------------------------------------------------------
     function Get-SourceUrl {
-        # 1) Prefer persisted file
         if (Test-Path -LiteralPath $SourcePath) {
             $u = (Get-Content -LiteralPath $SourcePath -Raw -ErrorAction SilentlyContinue).Trim()
             if (-not [string]::IsNullOrWhiteSpace($u)) { return $u }
         }
 
-        # 2) Fall back to environment variable
         $u = ($env:WBU_WU_SOURCE_URL | ForEach-Object { $_.Trim() })
         if ([string]::IsNullOrWhiteSpace($u)) {
             throw "Missing WBU_WU_SOURCE_URL. Your USB W.BAT must set WBU_WU_SOURCE_URL before launching the script."
         }
 
-        # Persist for post-reboot runs
         Set-Content -LiteralPath $SourcePath -Value $u -Encoding UTF8 -Force
         return $u
     }
 
-    # ------------------------------------------------------------
     # Resume mechanism: Scheduled Task at startup that re-downloads and re-runs script
-    # ------------------------------------------------------------
     function Ensure-ResumeScheduledTask {
         Import-Module ScheduledTasks -ErrorAction SilentlyContinue | Out-Null
 
@@ -105,18 +94,15 @@ try {
         if ($existing) { return }
 
         $null = Get-SourceUrl
-
         Write-Log "Creating Scheduled Task: $TaskName"
 
-        # Read URL from source.txt at runtime, then download and resume
         $cmd = @"
 Start-Sleep -Seconds 30
 `$u = (Get-Content -Raw '$SourcePath').Trim()
 if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
 "@
 
-        # Use -EncodedCommand to avoid cmd quoting issues
-        $bytes = [Text.Encoding]::Unicode.GetBytes($cmd)
+        $bytes   = [Text.Encoding]::Unicode.GetBytes($cmd)
         $encoded = [Convert]::ToBase64String($bytes)
 
         $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
@@ -142,9 +128,7 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
         }
     }
 
-    # ------------------------------------------------------------
     # PSWindowsUpdate setup
-    # ------------------------------------------------------------
     function Ensure-PSWindowsUpdate {
         if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate -ErrorAction SilentlyContinue)) {
             Write-Log "Installing PSWindowsUpdate module..."
@@ -183,16 +167,11 @@ if (-not [string]::IsNullOrWhiteSpace(`$u)) { iex (irm `$u) -Resume }
         Install-WindowsUpdate @params | Out-Null
     }
 
-    # ------------------------------------------------------------
     # Main
-    # ------------------------------------------------------------
-    Write-Log "Starting Windows Update runner. Resume = $Resume"
+    Write-Log "Starting Windows Update runner. Resume = $Resume; MicrosoftUpdate = $MicrosoftUpdate"
 
     Ensure-NuGetAndGalleryTrust
-
-    # Persist the source URL for after reboot runs
     $null = Get-SourceUrl
-
     Ensure-ResumeScheduledTask
     Ensure-PSWindowsUpdate
 
