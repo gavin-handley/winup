@@ -4,22 +4,16 @@ $ErrorActionPreference = 'Stop'
 
 try {
     # ------------------------------------------------------------
-    # OOBE-safe hardening
+    # OOBE-safe hardening / suppression
     # ------------------------------------------------------------
-
-    # TLS 1.2 for module downloads
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    # Execution policy for this process only
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
-
-    # Suppress progress noise
     $ProgressPreference = 'SilentlyContinue'
+    $ConfirmPreference  = 'None'   # suppress ShouldProcess confirmation prompts
 
     # ------------------------------------------------------------
     # Bootstrap NuGet / PSGallery
     # ------------------------------------------------------------
-
     if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
     }
@@ -32,23 +26,27 @@ try {
     # ------------------------------------------------------------
     # Install + import PSWindowsUpdate
     # ------------------------------------------------------------
-
-    if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+    if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate -ErrorAction SilentlyContinue)) {
         Install-Module -Name PSWindowsUpdate -Force -SkipPublisherCheck -AllowClobber -Scope AllUsers | Out-Null
     }
-
-    Import-Module PSWindowsUpdate -Force
-
-    # Enable Microsoft Update (Office, etc.) if available
-    try { Add-WUServiceManager -MicrosoftUpdate -ErrorAction SilentlyContinue | Out-Null } catch { }
+    Import-Module PSWindowsUpdate -Force -ErrorAction Stop | Out-Null
 
     # ------------------------------------------------------------
-    # Fully unattended update install
+    # Enable Microsoft Update (Office etc.) without prompting
     # ------------------------------------------------------------
+    try {
+        $mu = Get-WUServiceManager -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Microsoft Update' }
+        if (-not $mu) {
+            Add-WUServiceManager -MicrosoftUpdate -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        }
+    } catch { }
 
+    # ------------------------------------------------------------
+    # Fully unattended install
+    # ------------------------------------------------------------
     $updates = Get-WindowsUpdate -MicrosoftUpdate -IgnoreUserInput -ErrorAction SilentlyContinue
 
-    if (-not $updates) {
+    if (-not $updates -or $updates.Count -eq 0) {
         Write-Output "No updates available."
         exit 0
     }
@@ -61,9 +59,9 @@ try {
         -AutoReboot `
         -IgnoreUserInput `
         -Confirm:$false `
-        -ErrorAction Stop
+        -ErrorAction Stop | Out-Null
 
-    # If reboot is required, execution ends here automatically
+    # If reboot is required, the system will reboot and this process ends.
     Write-Output "Update pass completed. Rebooting if required."
     exit 0
 }
